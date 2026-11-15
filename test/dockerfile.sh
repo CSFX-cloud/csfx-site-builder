@@ -45,4 +45,19 @@ for expected in "--cache=true" "--cache-repo sites.csfx.invalid/site-1" "--snaps
 done
 [[ "$joined" != *"site-1:abcd1234"* ]] || fail_test "cache repository must not carry the image tag"
 
+if [[ "$(date +%s%3N)" =~ ^[0-9]+$ ]]; then
+    PHASES_FILE=$WORK/phases
+    : >"$PHASES_FILE"
+    timed clone_ms sleep 0.05
+    timed install_ms true
+    phases=$(phases_json)
+    [ "$(jq -r '.clone_ms >= 50' <<<"$phases")" = "true" ] || fail_test "clone phase was not measured"
+    [ "$(jq -r 'has("install_ms")' <<<"$phases")" = "true" ] || fail_test "install phase is missing"
+    timed build_ms false && fail_test "timed must keep the exit status"
+    [ "$(jq -r 'has("build_ms")' <<<"$(phases_json)")" = "true" ] || fail_test "failed phases must still be measured"
+
+else
+    echo "skip: phase timing needs GNU date"
+fi
+
 echo "ok"

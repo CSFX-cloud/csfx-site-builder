@@ -6,6 +6,7 @@ LOG_FILE=/tmp/csfx-build.log
 OFFSET_FILE=/tmp/csfx-build.offset
 LOCK_FILE=/tmp/csfx-build.lock
 ARTIFACT=/tmp/csfx-artifact.tar.gz
+PHASES_FILE=/tmp/csfx-build.phases
 KANIKO_ROOT=/kaniko-root
 EMPTY_JSON='{}'
 FLUSH_SECONDS=2
@@ -15,6 +16,7 @@ LAYER_CACHE_TTL=168h
 MANIFEST_FILES=(package.json package-lock.json npm-shrinkwrap.json yarn.lock .yarnrc .yarnrc.yml pnpm-lock.yaml pnpm-workspace.yaml bun.lock bun.lockb .npmrc)
 
 : >"$LOG_FILE"
+: >"$PHASES_FILE"
 echo 0 >"$OFFSET_FILE"
 
 callback() {
@@ -22,6 +24,24 @@ callback() {
     shift 2
     curl -fsS -X "$method" -H "Authorization: Bearer $CSFX_CALLBACK_TOKEN" "$@" \
         "$CSFX_CALLBACK_URL/callbacks/$CSFX_DEPLOYMENT_ID/$path"
+}
+
+now_ms() {
+    date +%s%3N
+}
+
+timed() {
+    local phase=$1 started status
+    shift
+    started=$(now_ms)
+    "$@"
+    status=$?
+    printf '%s %s\n' "$phase" "$(($(now_ms) - started))" >>"$PHASES_FILE"
+    return $status
+}
+
+phases_json() {
+    jq -Rn '[inputs | split(" ") | {key: .[0], value: (.[1] | tonumber)}] | from_entries' <"$PHASES_FILE"
 }
 
 log() {
@@ -100,10 +120,13 @@ build_static() {
     tar -czf "$ARTIFACT" --exclude=.git -C "$output" . || fail "could not package output"
     log INFO "uploading artifact bytes=$(stat -c %s "$ARTIFACT")"
     flush_logs
-    callback PUT artifact -H 'Content-Type: application/gzip' --data-binary @"$ARTIFACT" >>"$LOG_FILE" 2>&1 \
-        || fail "artifact upload failed"
-    report "$(jq -n --arg sha "$COMMIT_SHA" --arg message "$COMMIT_MESSAGE" \
-        '{success: true, commit_sha: $sha, commit_message: $message}')"
+    timed upload_ms upload_artifact || fail "artifact upload failed"
+    report "$(jq -n --arg sha "$COMMIT_SHA" --arg message "$COMMIT_MESSAGE" --argjson phases "$(phases_json)" \
+        '{success: true, commit_sha: $sha, commit_message: $message, phases: $phases}')"
+}
+
+upload_artifact() {
+    callback PUT artifact -H 'Content-Type: application/gzip' --data-binary @"$ARTIFACT" >>"$LOG_FILE" 2>&1
 }
 
 manifest_files() {
@@ -245,20 +268,20 @@ build_container() {
     log INFO "building image reference=$CSFX_IMAGE_REF"
     dockerfile_path=$(prepare_kaniko_root "$dockerfile")
     [ -n "$fallback_name" ] && fallback_path="${dockerfile_path%/*}/$fallback_name"
-    build_image "$dockerfile_path" "$fallback_path" || fail "image build failed"
-    report "$(jq -n --arg sha "$COMMIT_SHA" --arg message "$COMMIT_MESSAGE" --arg image "$CSFX_IMAGE_REF" \
-        '{success: true, commit_sha: $sha, commit_message: $message, image_ref: $image}')"
+    timed image_ms build_image "$dockerfile_path" "$fallback_path" || fail "image build failed"
+    report "$(jq -n --arg sha "$COMMIT_SHA" --arg message "$COMMIT_MESSAGE" --arg image "$CSFX_IMAGE_REF" --argjson phases "$(phases_json)" \
+        '{success: true, commit_sha: $sha, commit_message: $message, image_ref: $image, phases: $phases}')"
 }
 
 main() {
     export_environment || fail "invalid build environment"
-    clone_repository || fail "git clone failed"
+    timed clone_ms clone_repository || fail "git clone failed"
     commit_details
     PROJECT_DIR="$WORKDIR/${CSFX_ROOT_DIR:-}"
     [ -d "$PROJECT_DIR" ] || fail "root directory ${CSFX_ROOT_DIR:-} does not exist"
     if [ "$CSFX_MODE" = "static" ]; then
-        run_step install "${CSFX_INSTALL_COMMAND:-}" || fail "install command failed"
-        run_step build "${CSFX_BUILD_COMMAND:-}" || fail "build command failed"
+        timed install_ms run_step install "${CSFX_INSTALL_COMMAND:-}" || fail "install command failed"
+        timed build_ms run_step build "${CSFX_BUILD_COMMAND:-}" || fail "build command failed"
         build_static
     else
         build_container
