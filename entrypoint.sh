@@ -9,6 +9,10 @@ ARTIFACT=/tmp/csfx-artifact.tar.gz
 KANIKO_ROOT=/kaniko-root
 EMPTY_JSON='{}'
 FLUSH_SECONDS=2
+LAYERED_DOCKERFILE=Dockerfile.csfx
+FULL_COPY_DOCKERFILE=Dockerfile.csfx.full
+LAYER_CACHE_TTL=168h
+MANIFEST_FILES=(package.json package-lock.json npm-shrinkwrap.json yarn.lock .yarnrc .yarnrc.yml pnpm-lock.yaml pnpm-workspace.yaml bun.lock bun.lockb .npmrc)
 
 : >"$LOG_FILE"
 echo 0 >"$OFFSET_FILE"
@@ -102,20 +106,58 @@ build_static() {
         '{success: true, commit_sha: $sha, commit_message: $message}')"
 }
 
+manifest_files() {
+    local file
+    for file in "${MANIFEST_FILES[@]}"; do
+        [ -f "$PROJECT_DIR/$file" ] && printf '%s ' "$file"
+    done
+    return 0
+}
+
+dockerfile_head() {
+    echo "FROM node:22-slim"
+    echo "WORKDIR /app"
+    printf '%s' "${CSFX_BUILD_ENV:-$EMPTY_JSON}" | jq -r 'keys[] | "ARG \(.)\nENV \(.)=$\(.)"'
+}
+
+dockerfile_install() {
+    [ -n "${CSFX_INSTALL_COMMAND:-}" ] && echo "RUN corepack enable && $CSFX_INSTALL_COMMAND"
+    return 0
+}
+
+dockerfile_build() {
+    [ -n "${CSFX_BUILD_COMMAND:-}" ] && echo "RUN $CSFX_BUILD_COMMAND"
+    return 0
+}
+
+dockerfile_tail() {
+    echo "ENV NODE_ENV=production"
+    echo "EXPOSE ${CSFX_CONTAINER_PORT:-3000}"
+    jq -n --arg command "$CSFX_START_COMMAND" '"CMD [\"sh\", \"-c\", \($command | tojson)]"' -r
+}
+
+layered_dockerfile() {
+    dockerfile_head
+    echo "COPY $(manifest_files)./"
+    dockerfile_install
+    echo "COPY . ."
+    dockerfile_build
+    dockerfile_tail
+}
+
+full_copy_dockerfile() {
+    dockerfile_head
+    echo "COPY . ."
+    dockerfile_install
+    dockerfile_build
+    dockerfile_tail
+}
+
 node_dockerfile() {
     [ -f "$PROJECT_DIR/package.json" ] || return 1
     [ -n "${CSFX_START_COMMAND:-}" ] || return 1
-    {
-        echo "FROM node:22-slim"
-        echo "WORKDIR /app"
-        printf '%s' "${CSFX_BUILD_ENV:-$EMPTY_JSON}" | jq -r 'keys[] | "ARG \(.)\nENV \(.)=$\(.)"'
-        echo "COPY . ."
-        [ -n "${CSFX_INSTALL_COMMAND:-}" ] && echo "RUN corepack enable && $CSFX_INSTALL_COMMAND"
-        [ -n "${CSFX_BUILD_COMMAND:-}" ] && echo "RUN $CSFX_BUILD_COMMAND"
-        echo "ENV NODE_ENV=production"
-        echo "EXPOSE ${CSFX_CONTAINER_PORT:-3000}"
-        jq -n --arg command "$CSFX_START_COMMAND" '"CMD [\"sh\", \"-c\", \($command | tojson)]"' -r
-    } >"$PROJECT_DIR/Dockerfile.csfx"
+    layered_dockerfile >"$PROJECT_DIR/$LAYERED_DOCKERFILE"
+    full_copy_dockerfile >"$PROJECT_DIR/$FULL_COPY_DOCKERFILE"
 }
 
 build_arguments() {
@@ -175,6 +217,7 @@ collect_kaniko_arguments() {
     if [ "${CSFX_REGISTRY_INSECURE:-}" = "1" ]; then
         KANIKO_ARGS+=(--insecure --skip-tls-verify)
     fi
+    KANIKO_ARGS+=(--cache=true --cache-repo "${CSFX_IMAGE_REF%:*}" --cache-ttl "$LAYER_CACHE_TTL" --snapshot-mode=redo)
     if [ -n "${CSFX_REGISTRY_MIRROR:-}" ]; then
         KANIKO_ARGS+=(--registry-mirror "$CSFX_REGISTRY_MIRROR" --insecure-registry "$CSFX_REGISTRY_MIRROR")
     fi
@@ -183,16 +226,26 @@ collect_kaniko_arguments() {
     done < <(build_arguments)
 }
 
+build_image() {
+    local primary=$1 fallback=${2:-}
+    run_kaniko "$primary" && return 0
+    [ -n "$fallback" ] || return 1
+    log WARN "layered build failed, retrying with a full source copy"
+    run_kaniko "$fallback"
+}
+
 build_container() {
-    local dockerfile=Dockerfile dockerfile_path
+    local dockerfile=Dockerfile fallback_name="" dockerfile_path fallback_path=""
     if [ ! -f "$PROJECT_DIR/Dockerfile" ]; then
         node_dockerfile || fail "no Dockerfile found and the project cannot be built automatically"
-        dockerfile=Dockerfile.csfx
+        dockerfile=$LAYERED_DOCKERFILE
+        fallback_name=$FULL_COPY_DOCKERFILE
     fi
     collect_kaniko_arguments
     log INFO "building image reference=$CSFX_IMAGE_REF"
     dockerfile_path=$(prepare_kaniko_root "$dockerfile")
-    run_kaniko "$dockerfile_path" || fail "image build failed"
+    [ -n "$fallback_name" ] && fallback_path="${dockerfile_path%/*}/$fallback_name"
+    build_image "$dockerfile_path" "$fallback_path" || fail "image build failed"
     report "$(jq -n --arg sha "$COMMIT_SHA" --arg message "$COMMIT_MESSAGE" --arg image "$CSFX_IMAGE_REF" \
         '{success: true, commit_sha: $sha, commit_message: $message, image_ref: $image}')"
 }
@@ -212,9 +265,17 @@ main() {
     fi
 }
 
-stream_logs &
-STREAMER=$!
-main
-STATUS=$?
-kill "$STREAMER" 2>/dev/null
-exit $STATUS
+run() {
+    local streamer status
+    stream_logs &
+    streamer=$!
+    main
+    status=$?
+    kill "$streamer" 2>/dev/null
+    return $status
+}
+
+if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then
+    run
+    exit $?
+fi
